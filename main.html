@@ -1,0 +1,579 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>黒体輻射シミュレーター</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+      body {
+        font-family: 'Inter', sans-serif;
+      }
+      /* タブのスタイル */
+      .tab-button {
+        @apply px-4 py-2 text-lg font-semibold rounded-t-lg transition-colors duration-300;
+      }
+      .tab-button.active {
+        @apply bg-indigo-600 text-white;
+      }
+      .tab-button:not(.active) {
+        @apply bg-gray-700 text-gray-300 hover:bg-gray-600;
+      }
+      .tab-content {
+        @apply p-6 bg-gray-800 rounded-b-lg shadow-lg;
+      }
+    </style>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body class="bg-gray-900 text-gray-100 p-4 flex flex-col items-center min-h-screen">
+    <noscript>JavaScriptを有効にしてください。</noscript>
+    <div id="root" class="w-full max-w-4xl"></div>
+
+    <script type="text/babel">
+        // 物理定数
+        const H = 6.62607015e-34; // プランク定数 (J·s)
+        const C = 2.99792458e8;    // 光速 (m/s)
+        const K_B = 1.380649e-23;  // ボルツマン定数 (J/K)
+        const WIEN_B = 2.897771955e-3; // ウィーンの変位則の定数 (m·K)
+
+        /**
+         * プランクの法則に基づき、特定の波長におけるスペクトル放射輝度を計算します。
+         * @param {number} lambda_m - 波長 (メートル)
+         * @param {number} T_K - 温度 (ケルビン)
+         * @returns {number} スペクトル放射輝度 (W/(m^3·sr))
+         */
+        function planckLaw(lambda_m, T_K) {
+          if (lambda_m <= 0 || T_K <= 0) {
+            return 0;
+          }
+          const term1 = (2 * H * C**2) / (lambda_m**5);
+          const term2_exp = (H * C) / (lambda_m * K_B * T_K);
+
+          // Math.expm1(x) は Math.exp(x) - 1 と等価ですが、xが小さい場合に数値的に安定しています。
+          if (term2_exp > 700) { // 指数が非常に大きい場合のオーバーフローを避ける
+            return 0;
+          }
+          const denominator = Math.expm1(term2_exp);
+          if (denominator === 0) { // expm1が実質的に0を返す場合のゼロ除算を避ける
+              return 0;
+          }
+          const term2 = 1 / denominator;
+          return term1 * term2;
+        }
+
+        /**
+         * 指定された波長範囲でプランクの法則を数値積分します (台形公式)。
+         * @param {number} T_K - 温度 (ケルビン)
+         * @param {number} lambda_min_m - 最小波長 (メートル)
+         * @param {number} lambda_max_m - 最大波長 (メートル)
+         * @param {number} num_steps - 積分ステップ数
+         * @returns {number} 積分された放射輝度 (W/(m^2·sr))
+         */
+        function integratePlanck(T_K, lambda_min_m, lambda_max_m, num_steps = 1000) {
+          if (lambda_min_m >= lambda_max_m || T_K <= 0) {
+            return 0;
+          }
+
+          const step_size = (lambda_max_m - lambda_min_m) / num_steps;
+          let integral_sum = 0;
+
+          for (let i = 0; i < num_steps; i++) {
+            const lambda1 = lambda_min_m + i * step_size;
+            const lambda2 = lambda_min_m + (i + 1) * step_size;
+            const y1 = planckLaw(lambda1, T_K);
+            const y2 = planckLaw(lambda2, T_K);
+            integral_sum += (y1 + y2) / 2 * step_size;
+          }
+          return integral_sum;
+        }
+
+        /**
+         * 黒体輻射強度シミュレーターのメインコンポーネントです。
+         */
+        function App() {
+          const [temperature, setTemperature] = React.useState(1000); // 計算用温度 (K)
+          const [lambdaMin, setLambdaMin] = React.useState(1);       // 計算用開始波長 (µm)
+          const [lambdaMax, setLambdaMax] = React.useState(10);      // 計算用終了波長 (µm)
+          const [radianceResult, setRadianceResult] = React.useState(null); // 放射輝度結果 (W/(m^2·sr))
+          const [emittanceResult, setEmittanceResult] = React.useState(null); // 放射発散度結果 (W/m^2)
+          const [error, setError] = React.useState(''); // エラーメッセージ
+          const [activeTab, setActiveTab] = React.useState('calculator'); // アクティブなタブ
+
+          // グラフに表示する固定温度のリスト
+          const plotTemperatures = React.useMemo(() => [300, 600, 1000, 2000, 3000], []);
+          const canvasRef = React.useRef(null);
+
+          // Gemini API 関連のステート
+          const [geminiTemperature, setGeminiTemperature] = React.useState(1000); // Gemini用温度入力
+          const [geminiPrompt, setGeminiPrompt] = React.useState('この温度での黒体放射の特性を教えてください。'); // Gemini用プロンプト
+          const [geminiResponse, setGeminiResponse] = React.useState(null); // Geminiの応答
+          const [isGeminiLoading, setIsGeminiLoading] = React.useState(false); // Geminiローディング状態
+          const [geminiError, setGeminiError] = React.useState(''); // Geminiエラーメッセージ
+
+          /**
+           * 計算ボタンがクリックされたときのハンドラー。
+           * 入力値の検証を行い、プランクの法則に基づいて強度を計算します。
+           */
+          const handleCalculate = React.useCallback(() => {
+            setError(''); // エラーメッセージをクリア
+            setRadianceResult(null); // 結果をクリア
+            setEmittanceResult(null); // 結果をクリア
+
+            const T_K = parseFloat(temperature);
+            const lambda_min_um = parseFloat(lambdaMin);
+            const lambda_max_um = parseFloat(lambdaMax);
+
+            // 入力値の検証
+            if (isNaN(T_K) || T_K <= 0) {
+              setError('温度は正の数で入力してください。');
+              return;
+            }
+            if (isNaN(lambda_min_um) || lambda_min_um <= 0 || isNaN(lambda_max_um) || lambda_max_um <= 0) {
+              setError('波長範囲は正の数で入力してください。');
+              return;
+            }
+            if (lambda_min_um >= lambda_max_um) {
+              setError('開始波長は終了波長より小さくしてください。');
+              return;
+            }
+
+            try {
+              // 波長をマイクロメートルからメートルに変換
+              const lambda_min_m = lambda_min_um * 1e-6;
+              const lambda_max_m = lambda_max_um * 1e-6;
+
+              // 放射輝度 (W/(m^2·sr)) の計算
+              const integratedRadiance = integratePlanck(T_K, lambda_min_m, lambda_max_m);
+              setRadianceResult(integratedRadiance);
+
+              // 放射発散度 (W/m^2) の計算 (拡散放射体の場合、放射輝度 * π)
+              const integratedEmittance = integratedRadiance * Math.PI;
+              setEmittanceResult(integratedEmittance);
+
+            } catch (e) {
+              setError('計算中にエラーが発生しました。入力値を確認してください。');
+              console.error(e);
+            }
+          }, [temperature, lambdaMin, lambdaMax]); // 依存配列
+
+          // グラフ描画関数
+          const drawChart = React.useCallback(() => {
+            const canvas = canvasRef.current;
+            if (!canvas) return;
+
+            const ctx = canvas.getContext('2d');
+            const width = canvas.width;
+            const height = canvas.height;
+
+            // キャンバスをクリア
+            ctx.clearRect(0, 0, width, height);
+            ctx.fillStyle = '#1a202c'; // 背景色 (Tailwind bg-gray-900)
+            ctx.fillRect(0, 0, width, height);
+
+            // グラフの描画領域
+            const padding = 60;
+            const chartWidth = width - 2 * padding;
+            const chartHeight = height - 2 * padding;
+
+            // 波長範囲 (X軸) をマイクロメートル (µm) で定義
+            const lambdaMin_um_plot = 0.1;
+            const lambdaMax_um_plot = 30; // 30 µm まで表示
+            const numPoints = 500; // 描画点の数
+
+            // 各温度における放射輝度データを計算
+            const allPlotData = plotTemperatures.map(T => {
+              const data = [];
+              let maxRadiance = 0;
+              let peakLambda_um = 0;
+
+              // ウィーンの変位則によるピーク波長 (µm)
+              if (T > 0) {
+                peakLambda_um = (WIEN_B / T) * 1e6;
+              }
+
+              for (let i = 0; i <= numPoints; i++) {
+                const lambda_um = lambdaMin_um_plot + (i / numPoints) * (lambdaMax_um_plot - lambdaMin_um_plot);
+                const lambda_m = lambda_um * 1e-6; // メートルに変換
+                // W/(m^2·sr·µm) に変換して使いやすくする
+                const radiance = planckLaw(lambda_m, T) * 1e-6; // W/(m^3·sr) * m/µm = W/(m^2·sr·µm)
+                data.push({ lambda_um, radiance });
+                if (radiance > maxRadiance) {
+                  maxRadiance = radiance;
+                }
+              }
+              return { T, data, maxRadiance, peakLambda_um };
+            });
+
+            // Y軸の最大値を動的に決定 (全温度の最大放射輝度の中から最大値を選ぶ)
+            const overallMaxRadiance = Math.max(...allPlotData.map(d => d.maxRadiance), 1e-10); // ゼロ除算防止
+
+            // X軸のスケール関数
+            const scaleX = (lambda_um) => padding + (lambda_um - lambdaMin_um_plot) / (lambdaMax_um_plot - lambdaMin_um_plot) * chartWidth;
+            // Y軸のスケール関数 (対数スケール)
+            const scaleY = (radiance) => {
+              // 放射輝度が0の場合、グラフの下端に表示
+              if (radiance <= 0) return height - padding;
+              // 対数スケールで0を扱うため、最小値を設定
+              const logRadiance = Math.log10(radiance + 1e-100); // 非常に小さい値を加える
+              const logMaxRadiance = Math.log10(overallMaxRadiance + 1e-100);
+              const logMinRadiance = Math.log10(overallMaxRadiance * 1e-5 + 1e-100); // Y軸の最小値を最大値の1/100000に設定
+              
+              return height - padding - (logRadiance - logMinRadiance) / (logMaxRadiance - logMinRadiance) * chartHeight;
+            };
+
+            // 軸の描画
+            ctx.strokeStyle = '#cbd5e0'; // Tailwind text-gray-400
+            ctx.lineWidth = 1;
+
+            // X軸
+            ctx.beginPath();
+            ctx.moveTo(padding, height - padding);
+            ctx.lineTo(width - padding, height - padding);
+            ctx.stroke();
+
+            // Y軸
+            ctx.beginPath();
+            ctx.moveTo(padding, padding);
+            ctx.lineTo(padding, height - padding);
+            ctx.stroke();
+
+            ctx.fillStyle = '#cbd5e0';
+            ctx.font = '12px Inter, sans-serif';
+            ctx.textAlign = 'center';
+
+            // X軸ラベル
+            ctx.fillText('波長 λ (µm)', width / 2, height - padding / 2 + 10);
+            // Y軸ラベル
+            ctx.save();
+            ctx.translate(padding / 2 - 10, height / 2);
+            ctx.rotate(-Math.PI / 2);
+            ctx.fillText('スペクトル放射輝度 Bλ(T) (W/(m²·sr·µm))', 0, 0);
+            ctx.restore();
+
+            // X軸の目盛り
+            for (let i = 0; i <= 6; i++) {
+              const lambda_um = lambdaMin_um_plot + (i / 6) * (lambdaMax_um_plot - lambdaMin_um_plot);
+              const x = scaleX(lambda_um);
+              ctx.beginPath();
+              ctx.moveTo(x, height - padding);
+              ctx.lineTo(x, height - padding + 5);
+              ctx.stroke();
+              ctx.fillText(lambda_um.toFixed(1), x, height - padding + 20);
+            }
+
+            // Y軸の目盛り (対数スケール)
+            const numYLabels = 5;
+            for (let i = 0; i <= numYLabels; i++) {
+              const logValue = Math.log10(overallMaxRadiance * 1e-5) + (i / numYLabels) * (Math.log10(overallMaxRadiance) - Math.log10(overallMaxRadiance * 1e-5));
+              const value = Math.pow(10, logValue);
+              const y = scaleY(value);
+              ctx.beginPath();
+              ctx.moveTo(padding - 5, y);
+              ctx.lineTo(padding, y);
+              ctx.stroke();
+              ctx.textAlign = 'right';
+              ctx.fillText(value.toExponential(1), padding - 10, y + 4);
+            }
+            ctx.textAlign = 'center'; // リセット
+
+            // 各温度のスペクトルを描画
+            const colors = ['#f87171', '#fbbf24', '#a78bfa', '#34d399', '#60a5fa', '#f472b6', '#a3a3a3']; // Tailwind colors
+            allPlotData.forEach(({ T, data, peakLambda_um }, index) => {
+              ctx.beginPath();
+              ctx.strokeStyle = colors[index % colors.length];
+              ctx.lineWidth = 2;
+
+              data.forEach((point, i) => {
+                const x = scaleX(point.lambda_um);
+                const y = scaleY(point.radiance);
+                if (i === 0) {
+                  ctx.moveTo(x, y);
+                } else {
+                  ctx.lineTo(x, y);
+                }
+              });
+              ctx.stroke();
+
+              // 温度ラベルとピーク波長
+              ctx.fillStyle = colors[index % colors.length];
+              ctx.textAlign = 'left';
+              // ピーク波長の位置にラベルを表示
+              const peakX = scaleX(peakLambda_um);
+              const peakY = scaleY(planckLaw(peakLambda_um * 1e-6, T) * 1e-6);
+              if (peakX > padding && peakX < width - padding && peakY > padding && peakY < height - padding) {
+                ctx.fillText(`${T} K`, peakX + 5, peakY - 10);
+              } else {
+                // ピークがグラフ範囲外の場合、グラフの右端にラベルを表示
+                ctx.fillText(`${T} K`, width - padding + 5, scaleY(data[data.length - 1].radiance) + (index * 15 - 30));
+              }
+              ctx.textAlign = 'center'; // リセット
+
+              // ピーク波長のマーカー
+              if (peakLambda_um > lambdaMin_um_plot && peakLambda_um < lambdaMax_um_plot) {
+                const xPeak = scaleX(peakLambda_um);
+                const yPeak = scaleY(planckLaw(peakLambda_um * 1e-6, T) * 1e-6);
+                ctx.beginPath();
+                ctx.arc(xPeak, yPeak, 4, 0, 2 * Math.PI);
+                ctx.fill();
+                ctx.fillText(`ピーク: ${peakLambda_um.toFixed(2)} µm`, xPeak, height - padding + 35 + (index * 15));
+              }
+            });
+
+          }, [plotTemperatures]); // plotTemperaturesが変更されたら再描画
+
+          // アクティブなタブがプロットの場合にのみグラフを描画
+          React.useEffect(() => {
+            if (activeTab === 'plot') {
+              drawChart();
+            }
+          }, [activeTab, drawChart]);
+
+          // Gemini API呼び出し関数
+          const callGeminiAPI = React.useCallback(async () => {
+            setGeminiResponse(null);
+            setGeminiError('');
+            setIsGeminiLoading(true);
+
+            const promptText = `黒体放射について、以下の温度での特性と応用例を説明してください。温度: ${geminiTemperature} K。質問: ${geminiPrompt}`;
+            let chatHistory = [];
+            chatHistory.push({ role: "user", parts: [{ text: promptText }] });
+
+            const payload = { contents: chatHistory };
+            const apiKey = ""; // Canvas環境で自動的に提供されるため空のまま
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+
+            try {
+                const response = await fetch(apiUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    throw new Error(`APIエラー: ${response.status} ${response.statusText} - ${errorData.error.message}`);
+                }
+
+                const result = await response.json();
+                if (result.candidates && result.candidates.length > 0 &&
+                    result.candidates[0].content && result.candidates[0].content.parts &&
+                    result.candidates[0].content.parts.length > 0) {
+                    const text = result.candidates[0].content.parts[0].text;
+                    setGeminiResponse(text);
+                } else {
+                    setGeminiError('Geminiからの応答がありませんでした。');
+                }
+            } catch (e) {
+                setGeminiError(`Gemini API呼び出し中にエラーが発生しました: ${e.message}`);
+                console.error("Gemini API Error:", e);
+            } finally {
+                setIsGeminiLoading(false);
+            }
+          }, [geminiTemperature, geminiPrompt]);
+
+
+          return (
+            <div className="w-full max-w-4xl">
+              <h1 className="text-3xl font-bold mb-6 text-indigo-400 text-center">黒体輻射シミュレーター</h1>
+              <p className="mb-8 text-center max-w-2xl mx-auto">
+                黒体の温度と波長範囲を入力して強度を計算したり、複数の温度におけるスペクトル分布をプロットして比較できます。
+                さらに、Gemini AIに黒体放射に関する洞察を尋ねることもできます。
+              </p>
+
+              <div className="flex justify-center mb-4">
+                <button
+                  className={`tab-button ${activeTab === 'calculator' ? 'active' : ''}`}
+                  onClick={() => setActiveTab('calculator')}
+                >
+                  強度計算
+                </button>
+                <button
+                  className={`tab-button ${activeTab === 'plot' ? 'active' : ''}`}
+                  onClick={() => setActiveTab('plot')}
+                >
+                  スペクトルプロット
+                </button>
+                <button
+                  className={`tab-button ${activeTab === 'gemini' ? 'active' : ''}`}
+                  onClick={() => setActiveTab('gemini')}
+                >
+                  ✨Geminiの洞察✨
+                </button>
+              </div>
+
+              {activeTab === 'calculator' && (
+                <div className="tab-content">
+                  <div className="w-full max-w-md mx-auto">
+                    <div className="mb-4">
+                      <label htmlFor="temperature" className="block text-lg font-medium text-gray-300 mb-2">
+                        黒体温度 (K):
+                      </label>
+                      <input
+                        id="temperature"
+                        type="number"
+                        value={temperature}
+                        onChange={(e) => setTemperature(e.target.value)}
+                        className="w-full p-2 rounded-md bg-gray-700 border border-gray-600 text-gray-100 focus:ring-indigo-500 focus:border-indigo-500"
+                        min="1"
+                        step="100"
+                      />
+                    </div>
+
+                    <div className="mb-4 flex space-x-4">
+                      <div className="flex-1">
+                        <label htmlFor="lambdaMin" className="block text-lg font-medium text-gray-300 mb-2">
+                          開始波長 (µm):
+                        </label>
+                        <input
+                          id="lambdaMin"
+                          type="number"
+                          value={lambdaMin}
+                          onChange={(e) => setLambdaMin(e.target.value)}
+                          className="w-full p-2 rounded-md bg-gray-700 border border-gray-600 text-gray-100 focus:ring-indigo-500 focus:border-indigo-500"
+                          min="0.01"
+                          step="0.01"
+                        />
+                      </div>
+                      <div className="flex-1">
+                        <label htmlFor="lambdaMax" className="block text-lg font-medium text-gray-300 mb-2">
+                          終了波長 (µm):
+                        </label>
+                        <input
+                          id="lambdaMax"
+                          type="number"
+                          value={lambdaMax}
+                          onChange={(e) => setLambdaMax(e.target.value)}
+                          className="w-full p-2 rounded-md bg-gray-700 border border-gray-600 text-gray-100 focus:ring-indigo-500 focus:border-indigo-500"
+                          min="0.02"
+                          step="0.01"
+                        />
+                      </div>
+                    </div>
+
+                    <button
+                      onClick={handleCalculate}
+                      className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-4 rounded-md shadow-md transition duration-300 ease-in-out"
+                    >
+                      計算
+                    </button>
+                  </div>
+
+                  {error && (
+                    <div className="w-full max-w-md mx-auto bg-red-800 text-red-100 p-4 rounded-lg shadow-lg mt-8">
+                      <p className="font-bold">エラー:</p>
+                      <p>{error}</p>
+                    </div>
+                  )}
+
+                  {(radianceResult !== null && emittanceResult !== null) && (
+                    <div className="w-full max-w-md mx-auto bg-gray-700 rounded-lg shadow-lg p-6 mt-8">
+                      <h2 className="text-xl font-semibold mb-4 text-green-400">計算結果:</h2>
+                      <div className="space-y-3">
+                        <p className="text-lg">
+                          <span className="font-bold">放射輝度:</span>{' '}
+                          <span className="text-yellow-300">{radianceResult.toExponential(4)} W/(m²·sr)</span>
+                        </p>
+                        <p className="text-lg">
+                          <span className="font-bold">放射発散度:</span>{' '}
+                          <span className="text-yellow-300">{emittanceResult.toExponential(4)} W/m²</span>
+                        </p>
+                        <p className="text-sm text-gray-400 mt-4">
+                          (放射発散度は、拡散放射体として放射輝度を半球状に積分した値です。)
+                        </p>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {activeTab === 'plot' && (
+                <div className="tab-content">
+                  <div className="w-full max-w-4xl mx-auto">
+                    <h2 className="text-xl font-semibold mb-3 text-center">黒体スペクトルプロット</h2>
+                    <p className="text-center mb-4 text-gray-300">
+                      以下の温度におけるプランクの法則によるスペクトル放射輝度を示します。
+                      <br />Y軸は対数スケールです。
+                    </p>
+                    <canvas ref={canvasRef} width={800} height={500} className="w-full h-auto bg-gray-900 rounded-md"></canvas>
+                    <div className="mt-4 text-sm text-gray-400 text-center">
+                      <p>プロット温度: {plotTemperatures.join(' K, ')} K</p>
+                      <p>注: ピーク波長のラベルは、グラフ範囲外の場合、右端に表示されることがあります。</p>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {activeTab === 'gemini' && (
+                <div className="tab-content">
+                  <div className="w-full max-w-md mx-auto">
+                    <div className="mb-4">
+                      <label htmlFor="geminiTemp" className="block text-lg font-medium text-gray-300 mb-2">
+                        黒体温度 (K):
+                      </label>
+                      <input
+                        id="geminiTemp"
+                        type="number"
+                        value={geminiTemperature}
+                        onChange={(e) => setGeminiTemperature(e.target.value)}
+                        className="w-full p-2 rounded-md bg-gray-700 border border-gray-600 text-gray-100 focus:ring-indigo-500 focus:border-indigo-500"
+                        min="1"
+                        step="100"
+                      />
+                    </div>
+                    <div className="mb-4">
+                      <label htmlFor="geminiPrompt" className="block text-lg font-medium text-gray-300 mb-2">
+                        Geminiへの質問:
+                      </label>
+                      <textarea
+                        id="geminiPrompt"
+                        value={geminiPrompt}
+                        onChange={(e) => setGeminiPrompt(e.target.value)}
+                        className="w-full p-2 rounded-md bg-gray-700 border border-gray-600 text-gray-100 focus:ring-indigo-500 focus:border-indigo-500 h-24"
+                        placeholder="例: この温度の黒体放射の応用例を教えてください。"
+                      ></textarea>
+                    </div>
+                    <button
+                      onClick={callGeminiAPI}
+                      className="w-full bg-purple-600 hover:bg-purple-700 text-white font-bold py-3 px-4 rounded-md shadow-md transition duration-300 ease-in-out flex items-center justify-center"
+                      disabled={isGeminiLoading}
+                    >
+                      {isGeminiLoading ? (
+                        <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                        </svg>
+                      ) : (
+                        '✨ Geminiに質問 ✨'
+                      )}
+                    </button>
+                  </div>
+
+                  {geminiError && (
+                    <div className="w-full max-w-md mx-auto bg-red-800 text-red-100 p-4 rounded-lg shadow-lg mt-8">
+                      <p className="font-bold">エラー:</p>
+                      <p>{geminiError}</p>
+                    </div>
+                  )}
+
+                  {geminiResponse && (
+                    <div className="w-full max-w-md mx-auto bg-gray-700 rounded-lg shadow-lg p-6 mt-8">
+                      <h2 className="text-xl font-semibold mb-4 text-yellow-300">Geminiの応答:</h2>
+                      <div className="prose prose-invert text-gray-100">
+                        <p className="whitespace-pre-wrap">{geminiResponse}</p>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        }
+
+        // ReactアプリケーションをDOMにレンダリング
+        ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+    </script>
+</body>
+</html>
